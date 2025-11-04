@@ -4,6 +4,7 @@ Grid Trading Engine
 """
 
 import asyncio
+import math
 import os
 from typing import Dict, Optional
 import time
@@ -29,16 +30,18 @@ class GridEngine:
         poll_interval_sec: float = 1.0,
     ) -> None:
         self.adapter = adapter
-        self.symbol = symbol
+        # PydanticやSDKが文字列を要求するため文字列化して保持
+        self.symbol = str(symbol)
         self.poll_interval_sec = max(1.5, float(poll_interval_sec))
         self._running = False
         self._loop_iter: int = 0
 
         self.size = float(os.getenv("EDGEX_GRID_SIZE", os.getenv("EDGEX_SIZE", "0.01")))
-        self.step = float(os.getenv("EDGEX_GRID_STEP_USD", "100"))
+        # 既定: ステップ=50USD / 初回オフセット=100USD / レベル=10
+        self.step = float(os.getenv("EDGEX_GRID_STEP_USD", "50"))
         # 両側の価格幅(固定) だけ使い込む
         self.first_offset = float(os.getenv("EDGEX_GRID_FIRST_OFFSET_USD", "100"))
-        self.levels = int(os.getenv("EDGEX_GRID_LEVELS_PER_SIDE", "5"))
+        self.levels = int(os.getenv("EDGEX_GRID_LEVELS_PER_SIDE", "10"))
         logger.info(
             "グリッド設定: グリッド幅={}USD 初回オフセット={}USD レベル数={} サイズ={}BTC",
             self.step,
@@ -76,6 +79,12 @@ class GridEngine:
         except Exception:
             self.enforce_levels = True
 
+        # 価格刻み（BOX比較の許容誤差に利用）
+        try:
+            self.price_tick = float(os.getenv("EDGEX_PRICE_TICK", "0.1"))
+        except Exception:
+            self.price_tick = 0.1
+
         # 1ループあたりの新規発注上限（片側）: 明示指定があれば適用（任意）
         try:
             self.max_new_per_loop = int(os.getenv("EDGEX_GRID_MAX_NEW_PER_LOOP", "0"))
@@ -88,6 +97,20 @@ class GridEngine:
         except Exception:
             self.simple_mode = True
 
+        # 板を使わずティッカー価格のみで中間価格とみなすモード
+        try:
+            # 既定: ティッカーのみ（取得が安定）
+            self.use_ticker_only = str(os.getenv("EDGEX_USE_TICKER_ONLY", "1")).lower() in ("1", "true", "yes")
+        except Exception:
+            self.use_ticker_only = True
+
+        # BOX固定モード: 毎ループで P±(X + k*N) の集合に“きっちり”寄せる（余計はキャンセル・欠けは追加）
+        try:
+            # 既定: BOX（現在価格を中心に毎ループ寄せる）
+            self.box_mode = str(os.getenv("EDGEX_GRID_BOX_MODE", "1")).lower() in ("1", "true", "yes")
+        except Exception:
+            self.box_mode = True
+
         # 実注文の同期周期（ループ何回に1回か）。BINモードでの整合性確保用
         try:
             self.active_sync_every = int(os.getenv("EDGEX_GRID_ACTIVE_SYNC_EVERY", "3"))
@@ -97,9 +120,10 @@ class GridEngine:
         # ビン固定モード: 価格を N 刻みの絶対グリッドに揃える（例: 110000, 110100, 110200 ...）
         # ループ毎に現在価格から目標ビン集合を作り、差分で発注/取消のみ行う
         try:
-            self.bin_mode = str(os.getenv("EDGEX_GRID_BIN_MODE", "1")).lower() in ("1", "true", "yes")
+            # 既定: BINはOFF（強い固定グリッドは任意）
+            self.bin_mode = str(os.getenv("EDGEX_GRID_BIN_MODE", "0")).lower() in ("1", "true", "yes")
         except Exception:
-            self.bin_mode = True
+            self.bin_mode = False
         # BINモードの現在ビン位置（center_units）を保持し、方向性のインクリメンタル更新に用いる
         self._bin_center_units: int | None = None
 
@@ -152,14 +176,19 @@ class GridEngine:
                     logger.debug("グリッドループ開始: iter={} 配置済み買い={}本 配置済み売り={}本 初期化済み={}", 
                                 self._loop_iter, len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id), self.initialized)
 
-                    # 現在価格取得: まず板(bid/ask)からミッド算出（429回避・短期キャッシュ活用）。失敗時のみティッカーにフォールバック。
+                    # 現在価格取得
                     try:
-                        bid, ask = await self.adapter.get_best_bid_ask(self.symbol)
-                        if bid is not None and ask is not None:
-                            mid_price = (float(bid) + float(ask)) / 2.0
-                        else:
+                        if getattr(self, "use_ticker_only", False):
                             ticker = await self.adapter.get_ticker(self.symbol)
-                            mid_price = ticker.price  # type: ignore[attr-defined]
+                            mid_price = float(ticker.price)  # ティッカーの最終価格を採用
+                        else:
+                            # まず板の最良気配からミッド算出。無ければティッカー。
+                            bid, ask = await self.adapter.get_best_bid_ask(self.symbol)
+                            if bid is not None and ask is not None:
+                                mid_price = (float(bid) + float(ask)) / 2.0
+                            else:
+                                ticker = await self.adapter.get_ticker(self.symbol)
+                                mid_price = float(ticker.price)
                     except Exception as e:
                         logger.warning("中間価格の取得に失敗: {}", e)
                         await asyncio.sleep(self.poll_interval_sec)
@@ -175,8 +204,31 @@ class GridEngine:
                         sorted(self.placed_sell_px_to_id.keys()),
                     )
 
-                    # BINモード: 周期的に取引所のOPEN注文と突合（3ループに1回など）
-                    if self.bin_mode and getattr(self, "active_sync_every", 0) > 0 and (self._loop_iter % self.active_sync_every == 0):
+                    # 毎ループ: ポジションを取得して軽く表示（ズレの観測用）
+                    try:
+                        positions = await getattr(self.adapter, "fetch_positions", lambda *_args, **_kw: [])(self.symbol)
+                        net_size = 0.0
+                        for p in (positions or []):
+                            try:
+                                sz_raw = p.get("size") or p.get("positionSize") or p.get("qty")
+                                if sz_raw is None:
+                                    continue
+                                sz = float(sz_raw)
+                                side = str(p.get("side") or p.get("positionSide") or "").upper()
+                                if side in ("SHORT", "SELL"):
+                                    sz = -abs(sz)
+                                elif side in ("LONG", "BUY"):
+                                    sz = abs(sz)
+                                # 一部APIは符号付きサイズのみを返すためそのまま加算
+                                net_size += sz
+                            except Exception:
+                                continue
+                        logger.debug("pos: net_size={} raw_count={}", net_size, len(positions or []))
+                    except Exception:
+                        pass
+
+                    # 周期的に取引所のOPEN注文と突合（3ループに1回など）
+                    if getattr(self, "active_sync_every", 0) > 0 and (self._loop_iter % self.active_sync_every == 0):
                         await self._sync_active_orders_from_exchange()
 
                     # グリッド配置
@@ -262,6 +314,95 @@ class GridEngine:
         既に置いてある価格はスキップ。自サイドの最も近い注文とN未満にならないようにする。
         """
         if self.step <= 0:
+            return
+
+        # === BOXモード: 価格周りのボックスを毎ループ厳密維持（寄せる） ===
+        if getattr(self, "box_mode", False):
+            # 固定ラティス: 価格は step の絶対グリッド（…0, step, 2*step, ...）に揃える。
+            # 現在価格 P は「内側禁止帯 X」と本数選定だけに利用し、位置決めには使わない。
+            P = float(mid_price)
+            s = float(self.step)
+            X = float(self.first_offset)
+
+            # 買い側: P-X より下で最も近いグリッドから levels 本
+            lower_limit = P - X - 1e-9
+            buy_start = math.floor(lower_limit / s) * s
+            buy_targets = [buy_start - i * s for i in range(self.levels)]
+
+            # 売り側: P+X より上で最も近いグリッドから levels 本
+            upper_limit = P + X + 1e-9
+            sell_start = math.ceil(upper_limit / s) * s
+            sell_targets = [sell_start + i * s for i in range(self.levels)]
+
+            # 作業用に丸め（浮動小数の微小誤差対策）
+            def _r(x: float) -> float:
+                return round(float(x), 10)
+
+            buy_targets = [_r(px) for px in buy_targets if px > 0 and px < (P - 1e-9)]
+            sell_targets = [_r(px) for px in sell_targets if px > (P + 1e-9)]
+
+            current_buys = set(_r(px) for px in self.placed_buy_px_to_id.keys())
+            current_sells = set(_r(px) for px in self.placed_sell_px_to_id.keys())
+            target_buys = set(buy_targets)
+            target_sells = set(sell_targets)
+
+            # 許容誤差内なら“同一ターゲット扱い”にする（clamp等で微妙にズレても維持）
+            tol = max(self.price_tick * 1.01, 1e-6)
+            def _near_any(x: float, targets: set[float]) -> bool:
+                for t in targets:
+                    if abs(x - t) <= tol:
+                        return True
+                return False
+
+            keep_buys = set(px for px in current_buys if _near_any(px, target_buys))
+            keep_sells = set(px for px in current_sells if _near_any(px, target_sells))
+
+            # 内側の既存注文は必ず維持（取り消さない）
+            inner_buy_border = P - X
+            inner_sell_border = P + X
+            keep_buys |= set(px for px in current_buys if px >= (inner_buy_border - tol))
+            keep_sells |= set(px for px in current_sells if px <= (inner_sell_border + tol))
+
+            # 余計（ターゲット外で近似も無し）だけキャンセル
+            for px in sorted(current_buys - keep_buys):
+                try:
+                    oid = self.placed_buy_px_to_id.pop(px)
+                except KeyError:
+                    continue
+                try:
+                    await self.adapter.cancel_order(oid)
+                except Exception:
+                    pass
+                await asyncio.sleep(self.op_spacing_sec)
+
+            for px in sorted(current_sells - keep_sells):
+                try:
+                    oid = self.placed_sell_px_to_id.pop(px)
+                except KeyError:
+                    continue
+                try:
+                    await self.adapter.cancel_order(oid)
+                except Exception:
+                    pass
+                await asyncio.sleep(self.op_spacing_sec)
+
+            # 欠け（近似含め存在しないターゲット）を追加
+            for px in sorted(target_buys):
+                if not any(abs(cb - px) <= tol for cb in keep_buys):
+                    if self._has_min_gap(self.placed_buy_px_to_id, px):
+                        await self._place_order(OrderSide.BUY, px)
+                        await asyncio.sleep(self.op_spacing_sec)
+
+            for px in sorted(target_sells):
+                if not any(abs(cs - px) <= tol for cs in keep_sells):
+                    if self._has_min_gap(self.placed_sell_px_to_id, px):
+                        await self._place_order(OrderSide.SELL, px)
+                        await asyncio.sleep(self.op_spacing_sec)
+
+            # 初期化フラグ
+            if not self.initialized:
+                self.initialized = True
+                logger.info("BOX: 初期配置完了 買い{}本 売り{}本", len(self.placed_buy_px_to_id), len(self.placed_sell_px_to_id))
             return
 
         # === BIN固定モード: 方向性インクリメンタル ===

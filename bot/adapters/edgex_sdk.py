@@ -49,12 +49,13 @@ class EdgeXSDKAdapter(ExchangeAdapter):
 
     async def get_ticker(self, symbol: str) -> Ticker:
         assert self._client is not None
+        sym = str(symbol)
         # 429/一時エラーに備えてリトライ（指数バックオフ）
         backoff = 0.5
         last_err: Exception | None = None
         for _ in range(8):
             try:
-                resp = await self._client.get_24_hour_quote(str(symbol))
+                resp = await self._client.get_24_hour_quote(sym)
                 data = (resp or {}).get("data") or []
                 price = None
                 if data:
@@ -64,7 +65,7 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                         price = None
                 if price is None:
                     raise ValueError("ticker price not available via SDK")
-                return Ticker(symbol=symbol, price=price, ts_ms=self._now_ms())
+                return Ticker(symbol=sym, price=price, ts_ms=self._now_ms())
             except Exception as e:
                 msg = str(e)
                 last_err = e
@@ -127,7 +128,13 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             url = f"{base}/api/v1/public/quote/getDepth"
             params = {"contractId": str(symbol), "level": "15"}
             try:
-                async with httpx.AsyncClient(timeout=8.0, headers={"Accept": "application/json"}) as client:
+                # CDN対策としてUA/言語ヘッダを付与し、リダイレクトを追従
+                headers = {
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+                async with httpx.AsyncClient(timeout=8.0, headers=headers, follow_redirects=True) as client:
                     r = await client.get(url, params=params)
                     r.raise_for_status()
                     body = r.json()
@@ -318,10 +325,12 @@ class EdgeXSDKAdapter(ExchangeAdapter):
         except Exception:
             tick_val = 0.1
 
-        strict_maker = str(os.getenv("EDGEX_STRICT_MAKER", "true")).lower() in ("1", "true", "yes")
+        # 既定: 厳格メイカーはOFF（板が不明でも発注を止めない）。必要なら環境変数でONに
+        strict_maker = str(os.getenv("EDGEX_STRICT_MAKER", "false")).lower() in ("1", "true", "yes")
 
         orig_price_before_guard = price
-        maker_mode = str(os.getenv("EDGEX_MAKER_MODE", "validate")).lower()  # validate | clamp
+        # 既定: clamp（最良気配の外側に1tick寄せてメイカー確保）
+        maker_mode = str(os.getenv("EDGEX_MAKER_MODE", "clamp")).lower()  # validate | clamp
         # validate: 価格はそのまま（丸めのみ）。食い込みならエラー
         # clamp: best±tickへ寄せる（従来動作）
         if maker_mode == "clamp":
@@ -409,19 +418,30 @@ class EdgeXSDKAdapter(ExchangeAdapter):
             is_post_only,
             strict_maker,
         )
+        # 発注レスポンス待ちの上限（タイムアウト）
         try:
-            res = await self._client.create_limit_order(
-                contract_id=contract_id,
-                size=str(qty),
-                price=str(price),
-                side=side,
-                **extra_params,
+            order_timeout = float(os.getenv("EDGEX_ORDER_TIMEOUT_SEC", "8.0"))
+        except Exception:
+            order_timeout = 8.0
+
+        try:
+            res = await asyncio.wait_for(
+                self._client.create_limit_order(
+                    contract_id=contract_id,
+                    size=str(qty),
+                    price=str(price),
+                    side=side,
+                    **extra_params,
+                ),
+                timeout=order_timeout,
             )
         except Exception as e:
             # Extract as much detail as possible from SDK/httpx error
             detail: Dict[str, Any] = {"payload": payload}
             status_code: int | None = None
             body: Any = None
+            if isinstance(e, asyncio.TimeoutError):
+                raise RuntimeError(f"edgex order timeout ({order_timeout}s)") from e
             try:
                 if isinstance(e, httpx.HTTPStatusError):
                     status_code = e.response.status_code
@@ -657,3 +677,115 @@ class EdgeXSDKAdapter(ExchangeAdapter):
                 continue
 
         return norm_rows
+
+    async def fetch_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Return current positions. Tries multiple SDK shapes, falls back defensively.
+
+        Normalizes to a list[dict]. Each dict may contain keys like:
+        - contractId / symbol
+        - size / positionSize / qty (signed or with side)
+        - side / positionSide
+        - avgPrice / entryPrice
+        """
+        if self._client is None:
+            return []
+
+        client = self._client
+        resp: Any = None
+
+        # 1) Preferred: client.position.get_positions(params)
+        try:
+            if hasattr(client, "position") and hasattr(client.position, "get_positions"):
+                meth = client.position.get_positions
+                import inspect as _inspect
+                params: Dict[str, Any] = {}
+                try:
+                    sig = _inspect.signature(meth)
+                    names = sig.parameters.keys()
+                except Exception:
+                    names = []
+                if "account_id" in names:
+                    params["account_id"] = self.account_id
+                elif "accountId" in names:
+                    params["accountId"] = str(self.account_id)
+                if symbol:
+                    sym = str(symbol)
+                    for k in ("contract_id", "contractId", "symbol", "contractIdList", "symbols"):
+                        if k in names:
+                            params[k] = [sym] if k.endswith("List") or k.endswith("s") else sym
+                resp = await (meth(**params) if params else meth())
+        except Exception:
+            resp = None
+
+        # 2) Fallbacks: common legacy names
+        if resp is None:
+            cand_methods = [
+                (getattr(getattr(client, "position", object()), "get_position_page", None)),
+                getattr(client, "get_positions", None),
+                getattr(client, "get_position_page", None),
+            ]
+            for m in cand_methods:
+                if not callable(m):
+                    continue
+                try:
+                    import inspect as _inspect
+                    params: Dict[str, Any] = {}
+                    try:
+                        sig = _inspect.signature(m)
+                        names = sig.parameters.keys()
+                    except Exception:
+                        names = []
+                    if "account_id" in names:
+                        params["account_id"] = self.account_id
+                    elif "accountId" in names:
+                        params["accountId"] = str(self.account_id)
+                    if symbol:
+                        sym = str(symbol)
+                        for k in ("contract_id", "contractId", "symbol", "contractIdList", "symbols"):
+                            if k in names:
+                                params[k] = [sym] if k.endswith("List") or k.endswith("s") else sym
+                    resp = await (m(**params) if params else m())
+                    if resp is not None:
+                        break
+                except Exception:
+                    resp = None
+
+        # Normalize
+        rows: List[Dict[str, Any]] = []
+        try:
+            data = resp
+            if isinstance(resp, dict):
+                data = resp.get("data", resp)
+            if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                data = data.get("data")
+            if isinstance(data, dict):
+                rows_raw = (
+                    data.get("rows")
+                    or data.get("list")
+                    or data.get("positions")
+                    or data.get("dataList")
+                    or []
+                )
+            elif isinstance(data, list):
+                rows_raw = data
+            else:
+                rows_raw = []
+        except Exception:
+            rows_raw = []
+
+        for r in rows_raw:
+            try:
+                if isinstance(r, dict):
+                    rows.append(r)
+                else:
+                    obj = {
+                        "contractId": getattr(r, "contractId", getattr(r, "symbol", None)),
+                        "size": getattr(r, "size", getattr(r, "positionSize", getattr(r, "qty", None))),
+                        "side": getattr(r, "side", getattr(r, "positionSide", None)),
+                        "entryPrice": getattr(r, "entryPrice", getattr(r, "avgPrice", None)),
+                    }
+                    rows.append({k: v for k, v in obj.items() if v is not None})
+            except Exception:
+                continue
+
+        return rows
