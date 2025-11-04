@@ -190,7 +190,7 @@ class GridEngine:
                                 ticker = await self.adapter.get_ticker(self.symbol)
                                 mid_price = float(ticker.price)
                     except Exception as e:
-                        logger.warning("中間価格の取得に失敗: {}", e)
+                        logger.warning("ティッカー取得に失敗: {}", e)
                         await asyncio.sleep(self.poll_interval_sec)
                         continue
 
