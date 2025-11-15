@@ -191,7 +191,7 @@ class GridEngine:
                                 mid_price = float(ticker.price)
                     except Exception as e:
                         logger.warning("ティッカー取得に失敗: {}", e)
-                        await asyncio.sleep(self.poll_interval_sec)
+                        await asyncio.sleep(7.0)
                         continue
 
                     logger.debug(
