@@ -27,7 +27,7 @@ class GridEngine:
         self,
         adapter: ExchangeAdapter,
         symbol: str,
-        poll_interval_sec: float = 1.0,
+        poll_interval_sec: float = 7.0,
     ) -> None:
         self.adapter = adapter
         # PydanticやSDKが文字列を要求するため文字列化して保持
